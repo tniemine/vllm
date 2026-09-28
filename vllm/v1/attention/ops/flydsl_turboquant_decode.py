@@ -3,12 +3,14 @@
 """FlyDSL TurboQuant decode launcher (vLLM-side).
 
 Drop-in replacement for ``triton_turboquant_decode_attention_soa`` for the
-TQ decode profile HEAD_SIZE=128, MSE_BITS=4 K, VQB=4 V, N_CENTROIDS=16,
-BLOCK_SIZE in {16, 32}.
+TQ decode profile HEAD_SIZE ∈ {128, 256, 512}, MSE_BITS=4 K, VQB=4 V,
+N_CENTROIDS=16, BLOCK_SIZE in {16, 32}.
 
 Per-GQA kernel dispatch:
-  * GQA group ∈ {8, 16} → canonical kernels.tq_decode (Qwen-class)
-  * GQA group == 6      → kernels.tq_decode_gqa6 sibling (MiniMax-M2.5)
+  * GQA group ∈ {8, 16} → canonical kernels.tq_decode (Qwen-class, HS=128)
+                           kernels.tq_decode_hs256 (Gemma4 SW, HS=256)
+                           kernels.tq_decode_hs512 (Gemma4 global, HS=512)
+  * GQA group == 6      → kernels.tq_decode_gqa6 sibling (MiniMax-M2.5, HS=128)
 
 Auto-selected on gfx950 when FlyDSL is importable; falls back to the SoA Triton
 decode otherwise (wrong arch, missing build tree). The GQA-6 sibling is imported
@@ -44,8 +46,10 @@ logger = init_logger(__name__)
 
 
 _FLYDSL_AVAILABLE: bool | None = None
-_TQ_MOD: Any = None  # kernels.tq_decode module (Qwen GQA-{8,16})
-_TQ_MOD_GQA6: Any = None  # kernels.tq_decode_gqa6 module (MiniMax GQA-6, optional)
+_TQ_MOD: Any = None  # kernels.tq_decode module (Qwen GQA-{8,16}, HS=128)
+_TQ_MOD_GQA6: Any = None  # kernels.tq_decode_gqa6 module (MiniMax GQA-6, HS=128, optional)
+_TQ_MOD_256: Any = None  # kernels.tq_decode_hs256 (Gemma4 SW layers, HS=256, optional)
+_TQ_MOD_512: Any = None  # kernels.tq_decode_hs512 (Gemma4 global layers, HS=512, optional)
 _FLYC: Any = None  # flydsl.compiler
 _FX: Any = None  # flydsl.expr
 _TYPING_T: Any = None
@@ -56,12 +60,11 @@ _IR: Any = None
 def is_flydsl_available() -> bool:
     """Return True iff on gfx950 and FlyDSL imports + kernel module load.
 
-    The GQA-6 sibling kernel (``kernels.tq_decode_gqa6``) is imported
-    best-effort: if it's missing (older FlyDSL checkout that pre-dates
-    MiniMax support) the canonical Qwen path stays fully functional and
-    only GQA-6 dispatches will fail with a clear error at launch time.
+    The GQA-6 sibling and HS=256/512 kernels are imported best-effort: if
+    they are missing the canonical Qwen HS=128 path stays fully functional
+    and only those specific dispatches will fail with a clear error.
     """
-    global _FLYDSL_AVAILABLE, _TQ_MOD, _TQ_MOD_GQA6
+    global _FLYDSL_AVAILABLE, _TQ_MOD, _TQ_MOD_GQA6, _TQ_MOD_256, _TQ_MOD_512
     global _FLYC, _FX, _TYPING_T, _CC, _IR
     if _FLYDSL_AVAILABLE is not None:
         return _FLYDSL_AVAILABLE
@@ -89,7 +92,7 @@ def is_flydsl_available() -> bool:
         _IR = ir
         _TQ_MOD = tq_mod
         _FLYDSL_AVAILABLE = True
-        logger.info_once("FlyDSL TQ decode launcher: available")
+        logger.info_once("FlyDSL TQ decode launcher: available (HS=128)")
     except Exception as ex:  # noqa: BLE001
         _FLYDSL_AVAILABLE = False
         logger.warning_once(
@@ -113,6 +116,36 @@ def is_flydsl_available() -> bool:
             "GQA-6 models will fall back to SoA Triton decode.",
             ex,
         )
+    # Best-effort HS=256 import (Gemma4 sliding-window layers).
+    try:
+        from vllm.v1.attention.ops.flydsl_kernels import (
+            tq_decode_hs256 as tq_mod_256,
+        )
+
+        _TQ_MOD_256 = tq_mod_256
+        logger.info_once("FlyDSL TQ decode HS=256: available (Gemma4 SW layers)")
+    except Exception as ex:  # noqa: BLE001
+        _TQ_MOD_256 = None
+        logger.info_once(
+            "FlyDSL TQ decode HS=256: not available (%s); "
+            "HS=256 layers will fall back to SoA Triton decode.",
+            ex,
+        )
+    # Best-effort HS=512 import (Gemma4 global/full-attention layers).
+    try:
+        from vllm.v1.attention.ops.flydsl_kernels import (
+            tq_decode_hs512 as tq_mod_512,
+        )
+
+        _TQ_MOD_512 = tq_mod_512
+        logger.info_once("FlyDSL TQ decode HS=512: available (Gemma4 global layers)")
+    except Exception as ex:  # noqa: BLE001
+        _TQ_MOD_512 = None
+        logger.info_once(
+            "FlyDSL TQ decode HS=512: not available (%s); "
+            "HS=512 layers will fall back to SoA Triton decode.",
+            ex,
+        )
     return _FLYDSL_AVAILABLE
 
 
@@ -126,6 +159,25 @@ def is_flydsl_gqa6_available() -> bool:
     if _FLYDSL_AVAILABLE is None:
         is_flydsl_available()
     return _TQ_MOD_GQA6 is not None
+
+
+def is_flydsl_available_for_head_size(head_size: int) -> bool:
+    """Return True iff FlyDSL is available and has a kernel for ``head_size``.
+
+    Used by the eligibility gate in turboquant_attn.py in place of the
+    old ``self.head_size == 128`` hard-check, so that HS=256 (Gemma4
+    sliding-window) and HS=512 (Gemma4 global) layers are also eligible
+    when their respective kernel modules are importable.
+    """
+    if not is_flydsl_available():
+        return False
+    if head_size == 128:
+        return _TQ_MOD is not None
+    if head_size == 256:
+        return _TQ_MOD_256 is not None
+    if head_size == 512:
+        return _TQ_MOD_512 is not None
+    return False
 
 
 # -- Kernel module cache -------------------------------------------------------
@@ -370,6 +422,7 @@ def _get_kernel(
     scale: float,
     query_group_size: int,
     kv_block_size: int,
+    head_size: int = 128,
     use_hw_v_transpose: bool = False,
     num_seqs_hint: int = 1,
     tile_groups_per_partition: int = 1,
@@ -388,6 +441,7 @@ def _get_kernel(
         round(float(scale), 8),
         int(query_group_size),
         int(kv_block_size),
+        int(head_size),
         bool(use_hw_v_transpose),
         int(tile_groups_per_partition),
     )
@@ -401,10 +455,13 @@ def _get_kernel(
 
     _build_t0 = _t.perf_counter()
 
-    # Per-GQA dispatch: GQA-6 (MiniMax-M2.5) lives in the sibling module
-    # tq_decode_gqa6 to keep the Qwen kernel's invariants untouched.
-    # GQA-{8,16} (Qwen) keep using the canonical tq_decode kernel.
+    # Per-GQA / per-HS dispatch:
+    #   GQA-6 (MiniMax-M2.5, HS=128) → tq_decode_gqa6 sibling module.
+    #   GQA-{8,16}, HS=128 (Qwen)    → canonical tq_decode module.
+    #   GQA-{8,16}, HS=256 (Gemma4 SW)     → tq_decode_hs256 module.
+    #   GQA-{8,16}, HS=512 (Gemma4 global) → tq_decode_hs512 module.
     qg = int(query_group_size)
+    hs = int(head_size)
     if qg == 6:
         if _TQ_MOD_GQA6 is None:
             raise RuntimeError(
@@ -425,7 +482,13 @@ def _get_kernel(
             tile_groups_per_partition=int(tile_groups_per_partition),
         )
     else:
-        kmod = _TQ_MOD
+        _HS_MOD_MAP = {128: _TQ_MOD, 256: _TQ_MOD_256, 512: _TQ_MOD_512}
+        kmod = _HS_MOD_MAP.get(hs)
+        if kmod is None:
+            raise RuntimeError(
+                f"FlyDSL TQ decode: no kernel module for HEAD_SIZE={hs}. "
+                f"Supported: {sorted(k for k, v in _HS_MOD_MAP.items() if v is not None)}."
+            )
         kfn = kmod.build_tq_decode_module(
             num_seqs=int(num_seqs_hint),
             num_kv_heads=num_kv_heads,
@@ -586,11 +649,13 @@ def flydsl_turboquant_decode_attention(
       * mse_bits == 4
       * value_quant_bits == 4
       * centroids.numel() == 16
-      * D == 128
+      * D ∈ {128, 256, 512}
       * block_size in {16, 32}
       * Hq // Hk in {6, 8, 16}
-        - 8/16 → canonical tq_decode kernel (Qwen2.5-72B / Qwen3-32B)
-        - 6    → tq_decode_gqa6 sibling kernel (MiniMax-M2.5)
+        - 8/16, D=128 → canonical tq_decode kernel (Qwen2.5-72B / Qwen3-32B)
+        - 8/16, D=256 → tq_decode_hs256 kernel (Gemma4 sliding-window layers)
+        - 8/16, D=512 → tq_decode_hs512 kernel (Gemma4 global layers)
+        - 6,    D=128 → tq_decode_gqa6 sibling kernel (MiniMax-M2.5)
 
     Sinks are NYI and silently ignored if set. norm_correction is honored
     implicitly via the pre-folded stored K-norm (see footer comment).
@@ -611,7 +676,9 @@ def flydsl_turboquant_decode_attention(
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
     QG = Hq // Hk
-    assert D == _TQ_MOD.HEAD_SIZE
+    assert D in (128, 256, 512), (
+        f"FlyDSL supports HEAD_SIZE 128, 256 or 512, got {D}"
+    )
     assert block_size in (16, 32), (
         f"FlyDSL supports kv_block_size 16 or 32, got {block_size}"
     )
@@ -623,6 +690,9 @@ def flydsl_turboquant_decode_attention(
             "FlyDSL checkout (must include kernels/tq_decode_gqa6.py); "
             "otherwise the SoA Triton decode is the fallback."
         )
+    # Use the HS=128 canonical module to read N_CENTROIDS (it is the same
+    # across all head-size variants since the centroid count is a TQ preset
+    # parameter, not a function of HEAD_SIZE).
     assert centroids.numel() == _TQ_MOD.N_CENTROIDS, (
         f"centroids.numel={centroids.numel()} != {_TQ_MOD.N_CENTROIDS}"
     )
@@ -789,6 +859,7 @@ def flydsl_turboquant_decode_attention(
         scale,
         QG,
         block_size,
+        head_size=D,
         use_hw_v_transpose=use_hw_tr,
         num_seqs_hint=int(B),
         tile_groups_per_partition=int(tile_groups_per_partition),

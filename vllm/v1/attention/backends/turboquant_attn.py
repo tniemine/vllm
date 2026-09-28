@@ -56,6 +56,7 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flydsl_turboquant_decode import (
     flydsl_turboquant_decode_attention,
     is_flydsl_available,
+    is_flydsl_available_for_head_size,
     is_flydsl_gqa6_available,
 )
 from vllm.v1.attention.ops.triton_turboquant_decode import (
@@ -1241,9 +1242,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
         if self._use_flydsl:
-            # FlyDSL decode (gfx950, MSE-key, HEAD_SIZE=128, GQA in {6, 8, 16}).
-            # GQA-6 routes to the MiniMax sibling kernel. Ineligible layers fall
-            # back to SoA Triton decode.
+            # FlyDSL decode (gfx950, MSE-key, HEAD_SIZE ∈ {128, 256, 512},
+            # GQA in {6, 8, 16}). GQA-6 routes to the MiniMax sibling kernel;
+            # HS=256/512 route to the Gemma4-specific kernel variants.
+            # Ineligible layers fall back to SoA Triton decode.
             _gqa = self.num_kv_groups
             flydsl_gqa_ok = (_gqa in (8, 16)) or (
                 _gqa == 6 and is_flydsl_gqa6_available()
@@ -1252,7 +1254,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 not self.tq_config.key_fp8
                 and self.tq_config.key_mse_bits == 4
                 and self.tq_config.effective_value_quant_bits == 4
-                and self.head_size == 128
+                and is_flydsl_available_for_head_size(self.head_size)
                 and flydsl_gqa_ok
                 and self.sinks is None
                 and not (self.sliding_window and self.sliding_window > 0)
